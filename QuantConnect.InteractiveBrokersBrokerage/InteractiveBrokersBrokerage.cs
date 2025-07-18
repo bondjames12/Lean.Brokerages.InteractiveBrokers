@@ -337,7 +337,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 Config.Get("ib-trading-mode"),
                 Config.GetValue("ib-use-ibautomator", true),
                 Config.GetInt("ib-clientid", 0),
-                Config.GetValue("ib-agent-description", IB.AgentDescription.Individual)
+                Config.GetValue("ib-agent-description", IB.AgentDescription.Individual),
                 financialAdvisorsGroupFilter: Config.Get("ib-financial-advisors-group-filter")
                 )
         {
@@ -1384,7 +1384,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             _port = port;
             _useIBAutomator = useIBAutomator;
             ClientId = clientid;
-            _ibVersion = Convert.ToInt32(ibVersion, CultureInfo.InvariantCulture);
+            //_ibVersion = Convert.ToInt32(ibVersion, CultureInfo.InvariantCulture);
             _agentDescription = agentDescription;
 
             _symbolMapper = new InteractiveBrokersSymbolMapper(_mapFileProvider);
