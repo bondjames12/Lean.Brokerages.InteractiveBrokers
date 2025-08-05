@@ -886,6 +886,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                         }
 
                         Log.Trace("InteractiveBrokersBrokerage.Connect(): IB message processing thread ended: #" + Thread.CurrentThread.ManagedThreadId);
+                        Disconnect();
+                        OnMessage(BrokerageMessageEvent.Disconnected("Connection with Interactive Brokers broken."));
                     })
                     { IsBackground = true };
 
@@ -1056,7 +1058,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                         if (!HeartBeat(waitTimeMs))
                         {
                             // just in case we were unlucky, we are reconnecting or similar let's retry with a longer wait
-                            if (!HeartBeat(waitTimeMs * 1))
+                            if (!HeartBeat(waitTimeMs * 3))
                             {
                                 // we emit the disconnected event so that if the re connection below fails it will kill the algorithm
                                 OnMessage(BrokerageMessageEvent.Disconnected("Connection with Interactive Brokers lost. Heart beat failed."));
@@ -1263,7 +1265,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             {
                 Log.Error(exception);
             }
-            _client?.ClientSocket.eDisconnect();
+            if(_client.ClientSocket.IsConnected())
+                _client?.ClientSocket.eDisconnect();
 
             if (_messageProcessingThread != null)
             {
@@ -1476,6 +1479,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             {
                 Log.Trace($"InteractiveBrokersBrokerage.HandleConnectionClosed(): API client disconnected [Server Version: {_client.ClientSocket.ServerVersion}].");
                 _connectEvent.Set();
+                Connect();
             };
 
             // initialize our heart beat thread
