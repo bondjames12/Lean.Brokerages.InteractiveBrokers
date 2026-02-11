@@ -14,6 +14,7 @@
 */
 
 using System;
+using System.Text;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
@@ -41,6 +42,9 @@ using QuantConnect.Tests.Engine;
 using QuantConnect.Tests.Engine.DataFeeds;
 using QuantConnect.Util;
 using Order = QuantConnect.Orders.Order;
+using IB = QuantConnect.Brokerages.InteractiveBrokers.Client;
+using QuantConnect.Securities.IndexOption;
+using static QuantConnect.Brokerages.InteractiveBrokers.InteractiveBrokersAccountData;
 
 namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
 {
@@ -50,17 +54,58 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
     {
         private readonly List<Order> _orders = new List<Order>();
 
-        [SetUp]
+        private readonly SymbolPropertiesDatabase _symbolPropertiesDatabase = SymbolPropertiesDatabase.FromDataFolder();
+
+        private InteractiveBrokersSymbolMapper _symbolMapper = new InteractiveBrokersSymbolMapper(Composer.Instance.GetPart<IMapFileProvider>());
+
+        private InteractiveBrokersBrokerage _ib;
+
+        [OneTimeSetUp]
         public void Setup()
         {
             Log.LogHandler = new NUnitLogHandler();
             PythonInitializer.Initialize();
+            _ib = new InteractiveBrokersBrokerage();
         }
 
-        [TearDown]
+        [OneTimeTearDown]
         public void TearDown()
         {
             PythonInitializer.Shutdown();
+        }
+
+        [TestCase(-500, 623.794, 100, 622.181, -400, 624.19725, "B")]
+        [TestCase(100, 210.101, -200, 210.044, -100, 209.987, "B")]
+        [TestCase(-500, 623.794, -500, 623.794, -500, 623.794, "A")] // double A is ignored
+        public void MergeHoldingMergesOppositeSignedAAPLPositions(decimal holdingPositionQuantity, decimal holdingAvgPrice, decimal incomePositionQuantity,
+            decimal incomeAvgPrice, decimal expectedNewPositionQuantity, decimal expectedAvgPrice, string incomingAccount)
+        {
+            var aapl = Symbols.AAPL;
+
+            var holdings = new Dictionary<Symbol, MergedHoldings>();
+            holdings[aapl] = new();
+
+            holdings[aapl].Merge(new Holding
+            {
+                Symbol = aapl,
+                Quantity = holdingPositionQuantity,
+                AveragePrice = holdingAvgPrice
+            }, "A");
+
+            var incoming = new Holding
+            {
+                Symbol = aapl,
+                Quantity = incomePositionQuantity,
+                AveragePrice = incomeAvgPrice
+            };
+
+            InteractiveBrokersBrokerage.MergeHolding(holdings, incoming, incomingAccount);
+
+            var merged = holdings[aapl];
+
+            Assert.AreEqual(expectedNewPositionQuantity, merged.Holding.Quantity);
+            Assert.AreEqual(expectedAvgPrice, merged.Holding.AveragePrice);
+            Assert.AreEqual(aapl, merged.Holding.Symbol);
         }
 
         [Test]
@@ -920,6 +965,58 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             Assert.AreEqual(expectedCount, result.Count);
         }
 
+        private static IEnumerable<TestCaseData> LongRangeHistoricalDataTestCases()
+        {
+            yield return new TestCaseData(Symbols.AAPL, Resolution.Daily, new DateTime(1979, 06, 01), new DateTime(2025, 12, 30, 16, 0, 0), false);
+            yield return new TestCaseData(Symbols.AAPL, Resolution.Hour, new DateTime(1979, 06, 01), new DateTime(2025, 12, 30, 16, 0, 0), false);
+
+            var aud = Symbols.CreateFutureSymbol(Futures.Currencies.AUD, new(2026, 01, 16));
+            // the starting trade of 6A 2026/01/16 is on 2025/08/19
+            yield return new TestCaseData(aud, Resolution.Daily, new DateTime(2025, 06, 01), new DateTime(2025, 12, 30, 16, 0, 0), false);
+            yield return new TestCaseData(aud, Resolution.Hour, new DateTime(2025, 8, 17, 16, 0, 0), new DateTime(2025, 8, 20, 16, 0, 0), true);
+            yield return new TestCaseData(aud, Resolution.Daily, new DateTime(2025, 8, 17, 16, 0, 0), new DateTime(2025, 8, 20, 16, 0, 0), false);
+            // 2025/08/23 - Saturday, 2025/08/24 - Sunday
+            yield return new TestCaseData(aud, Resolution.Daily, new DateTime(2025, 8, 23, 9, 0, 0), new DateTime(2025, 8, 24, 16, 0, 0), true).SetDescription("Weekend");
+        }
+
+        [TestCaseSource(nameof(LongRangeHistoricalDataTestCases))]
+        public void GetsHistoricalDataForExtendedDateRanges(Symbol symbol, Resolution resolution, DateTime startDate, DateTime endDate, bool isEmpty)
+        {
+            Log.DebuggingEnabled = true;
+            var tz = TimeZones.NewYork;
+
+            var backwardsTs = endDate - startDate;
+            var result = GetHistory(symbol, resolution, tz, tz, endDate, backwardsTs, includeExtendedMarketHours: false);
+
+            Assert.AreEqual(result.Count == 0, isEmpty);
+        }
+
+        [TestCase("120 S", 120)]
+        [TestCase("1 D", 86400)]
+        [TestCase("1 M", 31 * 86400, Description = "Jan => Feb (2024/01/01 => 2024/02/01)")]
+        [TestCase("1 Y", 366 * 86400, Description = "referenceUtc: 2024 is a leap year")]
+        public void ParseDurationReturnsExpectedTimeSpan(string duration, int expectedSeconds)
+        {
+            var referenceUtc = new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+            var result = InteractiveBrokersBrokerage.ParseDuration(duration, referenceUtc);
+
+            Assert.AreEqual(TimeSpan.FromSeconds(expectedSeconds), result);
+        }
+
+        [TestCase("0 D")]
+        [TestCase("-5 S")]
+        [TestCase("0 M")]
+        [TestCase("abc")]
+        [TestCase("")]
+        [TestCase("10 W", Description = "Unsupported duration ib unit")]
+        public void ParseDurationReturnsOneDayWhenInvalidOrNonPositive(string duration)
+        {
+            var referenceUtc = new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+            var result = InteractiveBrokersBrokerage.ParseDuration(duration, referenceUtc);
+
+            Assert.AreEqual(TimeSpan.FromDays(1), result);
+        }
+
         [Test]
         public void IgnoresSecurityNotFoundErrorOnExpiredContractsHistoricalRequests()
         {
@@ -1075,6 +1172,191 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             var mondayMarketOpenSecondTickResult = InteractiveBrokersBrokerage.ShouldSkipTick(ndxSecurityExchangeHours, mondayMarketOpenDateTimeFirstTick);
 
             Assert.IsFalse(mondayMarketOpenSecondTickResult);
+        }
+
+        private static IEnumerable<TestCaseData> MarketOnOPenBoundaryRejectionTestData
+        {
+            get
+            {
+                yield return new TestCaseData(Symbols.AAPL, OrderType.MarketOnOpen, "2025-07-15T15:59:59.900", false, 0).SetDescription("Summer EDT - Before safe window - no wait");
+                yield return new TestCaseData(Symbols.AAPL, OrderType.MarketOnOpen, "2025-07-15T16:00:00.000", true, 10000).SetDescription("Summer EDT - Exactly at boundary - should wait");
+                yield return new TestCaseData(Symbols.AAPL, OrderType.MarketOnOpen, "2025-07-15T16:00:00.400", true, 9600).SetDescription("Summer EDT - Within safe buffer - should wait");
+                yield return new TestCaseData(Symbols.AAPL, OrderType.MarketOnOpen, "2025-07-15T16:00:10.000", false, 0).SetDescription("Summer EDT - After safe window - no wait");
+                yield return new TestCaseData(Symbols.AAPL, OrderType.MarketOnOpen, "2025-01-15T15:59:59.900", false, 0).SetDescription("Winter EST - Before safe window - no wait");
+                yield return new TestCaseData(Symbols.AAPL, OrderType.MarketOnOpen, "2025-01-15T16:00:00.000", true, 10000).SetDescription("Winter EST - Exactly at boundary - should wait");
+                yield return new TestCaseData(Symbols.AAPL, OrderType.MarketOnOpen, "2025-01-15T16:00:00.400", true, 9600).SetDescription("Winter EST - Within safe buffer - should wait");
+                yield return new TestCaseData(Symbols.AAPL, OrderType.MarketOnOpen, "2025-01-15T16:00:10.000", false, 0).SetDescription("Winter EST - After safe window - no wait");
+                yield return new TestCaseData(Symbols.AAPL, OrderType.MarketOnOpen, "2025-09-05T20:00:00.000", false, 0).SetDescription("Friday after regular market hours");
+                yield return new TestCaseData(Symbols.AAPL, OrderType.MarketOnOpen, "2025-09-18T08:00:00.000", false, 0);
+                yield return new TestCaseData(Symbols.AAPL, OrderType.MarketOnOpen, "2025-09-18T08:29:00.000", false, 0);
+
+                yield return new TestCaseData(Symbols.BTCUSD, OrderType.MarketOnOpen, "2025-09-05T20:00:00.000", false, 0).SetDescription("Doesn't support SecurityType");
+                yield return new TestCaseData(Symbols.SGX, OrderType.MarketOnOpen, "2025-09-05T20:00:00.000", false, 0).SetDescription("Doesn't support Market");
+                yield return new TestCaseData(Symbols.AAPL, OrderType.Market, "2025-09-05T20:00:00.000", false, 0).SetDescription("Doesn't support OrderType");
+            }
+        }
+
+        [Test, TestCaseSource(nameof(MarketOnOPenBoundaryRejectionTestData))]
+        public void AvoidMarketOnOpenBoundaryRejection(Symbol symbol, OrderType orderType, string nyTimeString, bool expectDelay, int expectedDelayMs)
+        {
+            var nyTime = DateTime.Parse(nyTimeString);
+
+            var result = _ib.TryAvoidMarketOnOpenBoundaryRejection(symbol, orderType, nyTime, out var delay);
+
+            Assert.AreEqual(expectDelay, result, "Unexpected boolean result for delay requirement");
+            Assert.AreEqual(expectedDelayMs, (int)delay.TotalMilliseconds, "Unexpected delay duration");
+        }
+
+        [Test]
+        public void GetTradingClassReturnsTradingClassFromCache()
+        {
+            using var ib = new InteractiveBrokersBrokerage(new QCAlgorithm(), new OrderProvider(), new SecurityProvider());
+            ib.Connect();
+
+            var future = Symbol.CreateFuture(Futures.Indices.SP500EMini, Market.CME, new DateTime(2025, 09, 19));
+            var index = Symbol.Create("SPX", SecurityType.Index, Market.USA);
+            var symbols = new Symbol[]
+            {
+                future,
+                Symbol.CreateOption(future, future.ID.Market, SecurityType.FutureOption.DefaultOptionStyle(), OptionRight.Put, 6725m, future.ID.Date),
+                Symbol.CreateOption(future, future.ID.Market, SecurityType.FutureOption.DefaultOptionStyle(), OptionRight.Call, 6725m, future.ID.Date),
+                Symbol.CreateOption(future, future.ID.Market, SecurityType.FutureOption.DefaultOptionStyle(), OptionRight.Put, 6750m, future.ID.Date),
+                Symbol.CreateOption(future, future.ID.Market, SecurityType.FutureOption.DefaultOptionStyle(), OptionRight.Call, 6750m, future.ID.Date),
+
+                Symbol.CreateOption(index, index.ID.Market, SecurityType.IndexOption.DefaultOptionStyle(), OptionRight.Call, 6300m, new(2025,08,15)),
+                Symbol.CreateOption(index, index.ID.Market, SecurityType.IndexOption.DefaultOptionStyle(), OptionRight.Call, 6350m, new(2025,08,15)),
+                Symbol.CreateOption(index, index.ID.Market, SecurityType.IndexOption.DefaultOptionStyle(), OptionRight.Put, 6395m, new(2025,08,15)),
+
+                Symbol.CreateOption(index, "SPXW", index.ID.Market, SecurityType.IndexOption.DefaultOptionStyle(), OptionRight.Call, 6355m, new(2025,08,15)),
+                Symbol.CreateOption(index, "SPXW", index.ID.Market, SecurityType.IndexOption.DefaultOptionStyle(), OptionRight.Put, 6320m, new(2025,08,15)),
+                Symbol.CreateOption(index, "SPXW", index.ID.Market, SecurityType.IndexOption.DefaultOptionStyle(), OptionRight.Put, 6310m, new(2025,08,15)),
+            };
+
+            var stopwatch = Stopwatch.StartNew();
+            foreach (var symbol in symbols)
+            {
+                var contract = CreateContract(symbol);
+                var tradingClass = ib._contractSpecificationService.GetTradingClass(contract, symbol);
+
+                Assert.IsFalse(string.IsNullOrEmpty(tradingClass), $"Trading class should not be null or empty for symbol {symbol}");
+
+                if (symbol.HasCanonical())
+                {
+                    Assert.IsTrue(ib._contractSpecificationService._tradingClassByCanonicalSymbol.TryGetValue(symbol.Canonical, out var contractSpecification),
+                        $"Cache should contain canonical for symbol {symbol}");
+                    Assert.IsNotEmpty(contractSpecification.TradingClass);
+                    Assert.Greater(contractSpecification.MinTick, 0m);
+                }
+                else
+                {
+                    Assert.IsFalse(ib._contractSpecificationService._tradingClassByCanonicalSymbol.ContainsKey(symbol.Canonical));
+                }
+            }
+            stopwatch.Stop();
+            Log.Trace($"Test.GetTradingClassReturnsTradingClassFromCache: performance test elapsed time: {stopwatch.ElapsedMilliseconds} ms");
+
+            ib.Disconnect();
+        }
+
+        private Contract CreateContract(Symbol symbol)
+        {
+            var securityType = InteractiveBrokersBrokerage.ConvertSecurityType(symbol.SecurityType);
+            var ibSymbol = _symbolMapper.GetBrokerageSymbol(symbol);
+
+            var symbolProperties = _symbolPropertiesDatabase.GetSymbolProperties(
+                symbol.ID.Market,
+                symbol,
+                symbol.SecurityType,
+                Currencies.USD);
+
+            var contract = new Contract
+            {
+                Symbol = ibSymbol,
+                Exchange = InteractiveBrokersBrokerage.GetSymbolExchange(symbol.SecurityType, symbol.ID.Market),
+                SecType = securityType,
+                Currency = symbolProperties.QuoteCurrency
+            };
+
+            if (symbol.ID.SecurityType.IsOption())
+            {
+                // Subtract a day from Index Options, since their last trading date
+                // is on the day before the expiry.
+                var lastTradeDate = symbol.ID.Date;
+                if (symbol.SecurityType == SecurityType.IndexOption)
+                {
+                    lastTradeDate = IndexOptionSymbol.GetLastTradingDate(symbol.ID.Symbol, symbol.ID.Date);
+                }
+                contract.LastTradeDateOrContractMonth = lastTradeDate.ToStringInvariant(DateFormat.EightCharacter);
+
+                contract.Right = symbol.ID.OptionRight == OptionRight.Call ? IB.RightType.Call : IB.RightType.Put;
+
+                contract.Strike = Convert.ToDouble(symbol.ID.StrikePrice);
+
+                contract.Symbol = ibSymbol;
+                contract.Multiplier = symbolProperties.ContractMultiplier.ToStringInvariant();
+            }
+
+            return contract;
+        }
+
+        [Test, Explicit("Long-running test (~10 minutes). Compares LEAN and IB API primary exchanges for up to 1000 equity symbols.")]
+        public void GetEquityPrimaryExchangeShouldMatchBetweenLeanAndIB()
+        {
+            using var ib = new InteractiveBrokersBrokerage(new QCAlgorithm(), new OrderProvider(), new SecurityProvider());
+            ib.Connect();
+
+            var tickers = QuantConnect.Algorithm.CSharp.StressSymbols.StockSymbols.ToList();
+
+            var totalCount = default(int);
+            var equalCount = default(int);
+
+            var logBuilder = new StringBuilder($"***** GetEquityPrimaryExchange Test ({tickers.Count} tickers) *****");
+            var logBuilder2 = new StringBuilder("***** MissMatched Symbols *****");
+
+            foreach (var ticker in tickers)
+            {
+                totalCount++;
+
+                var symbol = Symbol.Create(ticker, SecurityType.Equity, Market.USA);
+
+                var contract = CreateContract(symbol);
+
+                var leanPrimaryExchange = ib.GetPrimaryExchange(contract, symbol);
+
+                var ibPrimaryExchange = ib.GetContractDetails(contract, symbol.Value)?.Contract.PrimaryExch;
+
+                if (ibPrimaryExchange == null)
+                {
+                    totalCount--;
+                    logBuilder.AppendLine($"[SKIP] Contract not found for {symbol}");
+                    continue;
+                }
+
+                if (totalCount == 1000)
+                {
+                    logBuilder.AppendLine("Symbol processing limit reached (1000). Stopping test.");
+                    break;
+                }
+
+                Assert.IsNotNull(leanPrimaryExchange);
+
+                bool isEqual = string.Equals(leanPrimaryExchange, ibPrimaryExchange, StringComparison.InvariantCultureIgnoreCase);
+                if (isEqual)
+                {
+                    logBuilder.AppendLine($"[RESULT] {symbol.Value} | LEAN = {leanPrimaryExchange} | IB API = {ibPrimaryExchange} | Match = {isEqual}");
+                    equalCount++;
+                }
+                else
+                {
+                    logBuilder2.AppendLine($"[RESULT] {symbol.Value} | LEAN = {leanPrimaryExchange} | IB API = {ibPrimaryExchange} | Match = {isEqual}");
+                }
+            }
+
+            logBuilder.AppendLine("----- Test Summary -----");
+            logBuilder.AppendLine($"Processed: {totalCount} | Matches: {equalCount} | Mismatches: {totalCount - equalCount}");
+
+            Log.Trace(logBuilder.ToString());
+            Log.Trace(logBuilder2.ToString());
         }
 
         private List<BaseData> GetHistory(
@@ -1376,6 +1658,58 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 return [null, underlying2, underlying];
             }
             throw new NotImplementedException();
+        }
+
+        [Test]
+        public void HandleErrorCompetingLiveSessionIsThrottled()
+        {
+            using var brokerage = GetBrokerage();
+            const int invocationCount = 5;
+            var messageInvocationCount = 0;
+
+            void OnMessage(object _, BrokerageMessageEvent message)
+            {
+                if (message.Code == IB.CompetingLiveSessionMarketDataErrorHandler.ErrorCode.ToString())
+                {
+                    messageInvocationCount++;
+                }
+            }
+
+            Assert.IsTrue(brokerage.IsConnected);
+
+            brokerage.Message += OnMessage;
+
+            for (var i = 0; i < invocationCount; i++)
+            {
+                var errorEvent = new IB.ErrorEventArgs(
+                    id: 1,
+                    time: 0,
+                    code: IB.CompetingLiveSessionMarketDataErrorHandler.ErrorCode,
+                    message: "No market data during competing live session. Origin: [Id=5] Subscribe: SPY (STK SPY USD Smart ARCA  0 )");
+
+                brokerage.HandleError(this, errorEvent);
+            }
+
+            brokerage.Message -= OnMessage;
+
+            Assert.That(messageInvocationCount, Is.EqualTo(1));
+        }
+
+        [Test]
+        public void HandleEmitsOnlyOnceWithinThrottleInterval()
+        {
+            var emittedCount = 0;
+            var handler = new IB.CompetingLiveSessionMarketDataErrorHandler(_ => emittedCount++);
+            var now = DateTime.UtcNow;
+
+            for (var i = 0; i < 5; i++)
+            {
+                handler.Handle(now, IB.CompetingLiveSessionMarketDataErrorHandler.ErrorCode, "Test message");
+            }
+
+            Assert.AreEqual(1, emittedCount, "Handler should throttle repeated messages within interval");
+            handler.Handle(now.AddMinutes(15).AddSeconds(1), IB.CompetingLiveSessionMarketDataErrorHandler.ErrorCode, "Test message 2");
+            Assert.AreEqual(2, emittedCount, "Handler should emit again after throttle interval");
         }
     }
 }
